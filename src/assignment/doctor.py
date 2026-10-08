@@ -1,4 +1,4 @@
-"""Validate local assignment configuration without launching a Modal sandbox."""
+"""Validate local assignment configuration without launching a sandbox."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ import httpx
 from dotenv import load_dotenv
 from modal.config import Config
 
+from assignment.docker_backend import docker_status
+from assignment.env import sandbox_backend
 from assignment.task import Task
 from assignment.utils.image import SourceMismatch, verify_source
 
@@ -45,11 +47,28 @@ def main() -> int:
         except (FileNotFoundError, SourceMismatch, ValueError) as exc:
             failures.append(f"{task_path}: {exc}")
 
-    modal_config = Config()
-    if modal_config.get("token_id") and modal_config.get("token_secret"):
-        print("[ok] Modal credentials are configured")
-    else:
-        failures.append("Modal credentials are missing; run `uv run modal setup`")
+    try:
+        backend = sandbox_backend()
+    except ValueError as exc:
+        backend = None
+        failures.append(str(exc))
+    if backend == "docker":
+        ok, detail = docker_status()
+        if ok:
+            print(f"[ok] sandbox backend: docker (server {detail})")
+            if not detail.endswith("amd64"):
+                warnings.append("SWE-bench images are x86_64 only; this daemon is not amd64")
+        else:
+            failures.append(
+                f"docker is not usable: {detail}. Install Docker, or add this user to the "
+                "`docker` group, or set SANDBOX_BACKEND=modal"
+            )
+    elif backend == "modal":
+        modal_config = Config()
+        if modal_config.get("token_id") and modal_config.get("token_secret"):
+            print("[ok] sandbox backend: modal (credentials are configured)")
+        else:
+            failures.append("Modal credentials are missing; run `uv run modal setup`")
 
     api_key = _configured("OPENAI_API_KEY")
     base_url = _configured("OPENAI_BASE_URL")
@@ -101,9 +120,9 @@ def main() -> int:
     if failures:
         for failure in failures:
             print(f"[error] {failure}")
-        print("Configuration is not ready; no Modal sandbox was launched.")
+        print("Configuration is not ready; no sandbox was launched.")
         return 1
-    print("Assignment configuration is ready; no Modal sandbox was launched.")
+    print("Assignment configuration is ready; no sandbox was launched.")
     return 0
 
 

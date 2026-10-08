@@ -1,4 +1,4 @@
-"""Build a task's testbed image on Modal from a local checkout.
+"""Build a task's testbed image, on Modal or with local Docker, from a local checkout.
 
 The repository under test is copied in from `task.source` — normally the
 `chess_app/` submodule — rather than cloned inside the build. That keeps the
@@ -14,11 +14,14 @@ already-fixed working tree would make a broken agent look like it passed.
 from __future__ import annotations
 
 import logging
+import shlex
 import subprocess
 from pathlib import Path
 
 import modal
 
+from assignment.docker_backend import DockerImage, build_image
+from assignment.env import sandbox_backend
 from assignment.task import Task
 
 logger = logging.getLogger(__name__)
@@ -84,21 +87,47 @@ def verify_source(task: Task, strict: bool = True) -> None:
             "which silently invalidates the evaluation if one of them is the fix."
         )
 
-def build_testbed_image(task: Task, strict: bool = True, force_build: bool = False) -> modal.Image:
+def build_docker_testbed_image(task: Task, force_build: bool = False) -> DockerImage:
+    """Build the testbed with the local Docker daemon, from the same inputs.
+
+    The build context is a filtered copy of `task.source`, so the checkout is
+    never modified, and the pins are installed as the last layer, as on Modal.
+    """
+    dockerfile = task.dockerfile.read_text()
+    if task.pins:
+        logger.info("Pinning %d packages on top of the built image", len(task.pins))
+        pins = " ".join(shlex.quote(pin) for pin in task.pins)
+        dockerfile = dockerfile.rstrip("\n") + f"\n\nRUN pip install --no-cache-dir {pins}\n"
+
+    files = [
+        (path, path.relative_to(task.source).as_posix())
+        for path in sorted(task.source.rglob("*"))
+        if path.is_file() and not is_ignored(path.relative_to(task.source))
+    ]
+    tag = build_image(dockerfile, files, name=task.id, force_build=force_build)
+    return DockerImage(tag)
+
+
+def build_testbed_image(
+    task: Task, strict: bool = True, force_build: bool = False
+) -> modal.Image | DockerImage:
     """Build the image holding the repository under test at its base commit.
 
     Args:
         task: The task whose Dockerfile and source checkout to build from.
         strict: Refuse to build when the checkout does not match the task's
             base commit. See `verify_source`.
-        force_build: Skip Modal's build cache.
+        force_build: Skip the build cache.
 
     Returns:
-        A Modal image with the repository installed at /testbed.
+        An image with the repository installed at /testbed: a `DockerImage` on
+        the docker backend, a Modal image otherwise.
     """
     verify_source(task, strict=strict)
 
     logger.info("Building %s from %s at %s", task.id, task.source, task.base_commit[:12])
+    if sandbox_backend() == "docker":
+        return build_docker_testbed_image(task, force_build=force_build)
     image = modal.Image.from_dockerfile(
         str(task.dockerfile),
         context_dir=str(task.source),

@@ -1,13 +1,31 @@
 import asyncio
+import os
 import posixpath
 import time
 from pathlib import PurePath
 from typing import Any
 
 import modal
+from dotenv import load_dotenv
 from swerex.deployment.modal import ModalDeployment
 from swerex.runtime.abstract import Command
 from swerex.runtime.remote import RemoteRuntime
+
+from assignment.docker_backend import DockerContainer
+
+BACKENDS = ("docker", "modal")
+
+
+def sandbox_backend() -> str:
+    """Where sandboxes run: `docker` (local containers, the default) or `modal`.
+
+    Read from SANDBOX_BACKEND, which may also be set in `.env`.
+    """
+    load_dotenv()
+    backend = os.environ.get("SANDBOX_BACKEND", "").strip().lower() or "docker"
+    if backend not in BACKENDS:
+        raise ValueError(f"SANDBOX_BACKEND must be one of {', '.join(BACKENDS)}, not {backend!r}")
+    return backend
 
 
 def _tls_port_configuration(
@@ -96,7 +114,8 @@ class AssignmentModalDeployment(ModalDeployment):
 
 class Environment:
     """
-    Executes bash commands in a Modal sandbox via SWE-ReX.
+    Executes bash commands in a sandbox: a local Docker container, or a Modal
+    sandbox via SWE-ReX, chosen by `sandbox_backend()`.
     """
 
     # NOTE(source): https://github.com/SWE-agent/mini-swe-agent/blob/main/src/minisweagent/environments/extra/swerex_modal.py
@@ -118,7 +137,8 @@ class Environment:
             image: A prebuilt `modal.Image`, a Dockerhub or ECR image name, or a
                 path to a Dockerfile. Build a task testbed with
                 `assignment.utils.image.build_testbed_image`, which is the only
-                way to pass a credential to a private clone.
+                way to pass a credential to a private clone. The docker backend
+                takes an image name or a `DockerImage` from that function.
             cwd: Working directory for commands that do not specify one.
             startup_timeout: Seconds to wait for the SWE-ReX runtime to come up.
             runtime_timeout: Seconds a single command may run before timing out.
@@ -138,20 +158,33 @@ class Environment:
         self.cwd = cwd
         # Merged into every command's environment; a per-call `env` wins.
         self.env_defaults: dict[str, str] = {}
-        self.deployment = AssignmentModalDeployment(
-            image=image,
-            startup_timeout=startup_timeout,
-            runtime_timeout=runtime_timeout,
-            deployment_timeout=deployment_timeout,
-            install_pipx=install_pipx,
-            modal_sandbox_kwargs=modal_sandbox_kwargs,
-        )
+        self.backend = sandbox_backend()
+        if self.backend == "docker":
+            # The ports a Modal sandbox would tunnel are published on loopback.
+            kwargs = modal_sandbox_kwargs or {}
+            self.deployment = DockerContainer(
+                image=image,
+                deployment_timeout=deployment_timeout,
+                runtime_timeout=runtime_timeout,
+                startup_timeout=startup_timeout,
+                ports=[*kwargs.get("encrypted_ports", []), *kwargs.get("unencrypted_ports", [])],
+            )
+            self.deployment.start()
+        else:
+            self.deployment = AssignmentModalDeployment(
+                image=image,
+                startup_timeout=startup_timeout,
+                runtime_timeout=runtime_timeout,
+                deployment_timeout=deployment_timeout,
+                install_pipx=install_pipx,
+                modal_sandbox_kwargs=modal_sandbox_kwargs,
+            )
 
-        async def _start():
-            await self.deployment.start()
-            await self.deployment.is_alive()
+            async def _start():
+                await self.deployment.start()
+                await self.deployment.is_alive()
 
-        asyncio.run(_start())
+            asyncio.run(_start())
 
         if conda_env:
             self.activate_conda_env(conda_env)
@@ -169,6 +202,8 @@ class Environment:
         deployment keeps its handle afterwards, so this asks the sandbox itself
         rather than trusting the handle's existence.
         """
+        if self.backend == "docker":
+            return self.deployment.running()
         sandbox = self.deployment._sandbox
         return sandbox is not None and sandbox.poll() is None
 
@@ -250,7 +285,10 @@ class Environment:
         arguments.setdefault("cwd", self.cwd)
 
         try:
-            result = asyncio.run(self.deployment.runtime.execute(Command(**arguments)))
+            if self.backend == "docker":
+                result = self.deployment.execute(Command(**arguments))
+            else:
+                result = asyncio.run(self.deployment.runtime.execute(Command(**arguments)))
             output = {
                 "stdout": result.stdout,
                 "stderr": result.stderr,
@@ -292,6 +330,9 @@ class Environment:
             timeout: Seconds allowed for each of the shutdown and the
                 termination steps.
         """
+        if self.backend == "docker":
+            self.deployment.stop(timeout=max(timeout, 30))
+            return
 
         async def _stop():
             # ModalDeployment.stop() has an inverted poll() check and only
@@ -308,7 +349,12 @@ class Environment:
         asyncio.run(_stop())
 
     def tunnel_url(self, port: int) -> str:
-        """Return the public URL for a port forwarded when the sandbox started."""
+        """Return the public URL for a port forwarded when the sandbox started.
+
+        On the docker backend this is a loopback URL on the host.
+        """
+        if self.backend == "docker":
+            return self.deployment.port_url(port)
 
         async def _tunnel_url() -> str:
             tunnels = await self.deployment.sandbox.tunnels.aio()

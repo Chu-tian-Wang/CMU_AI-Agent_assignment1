@@ -133,10 +133,105 @@ INVOKE_SKILL_TOOL = {
 # TODO(3.1.a): Define an OpenAI function-tool schema named ``play_move``.
 # It must accept exactly one required string argument named ``move``, explain
 # that moves use UCI notation (for example e2e4), and reject extra arguments.
-PLAY_MOVE_TOOL: dict = {}
+PLAY_MOVE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "play_move",
+        "description": (
+            "Play one move for White on the live game board. The server then "
+            "plays Black's reply automatically and returns the new state.\n"
+            "\n"
+            "Moves use UCI notation: the from-square followed by the to-square, "
+            "for example `e2e4` or `g1f3`. Castling is written as the king's "
+            "move, such as `e1g1`, and a promotion appends the piece letter, "
+            "such as `e7e8q`."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "move": {
+                    "type": "string",
+                    "description": (
+                        "White's move in UCI notation, for example e2e4 or e7e8q."
+                    ),
+                },
+            },
+            "required": ["move"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 # TODO(3.3): Define the `simulate_move` tool, like the `play_move` tool.
-SIMULATE_MOVE_TOOL: dict = {}
+SIMULATE_MOVE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "simulate_move",
+        "description": (
+            "Inspect a hypothetical position, or play one ply in it, without "
+            "touching the live game. The real board does not change and the "
+            "opponent does not reply.\n"
+            "\n"
+            "With `move` set to null, returns the position described by `fen` "
+            "and its legal moves. With a UCI `move` (for example `e2e4` or "
+            "`e7e8q`), applies that single move for whichever side is to move "
+            "and returns the resulting position. The result is JSON with `fen`, "
+            "`squares`, `turn`, `legal_moves`, `in_check`, `game_over`, "
+            "`winner`, and `result`. Pass a returned `fen` back in to look "
+            "further ahead."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fen": {
+                    "type": "string",
+                    "description": "A complete six-field FEN of the position.",
+                },
+                "move": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "One UCI move to apply in that position, or null to "
+                        "only inspect it."
+                    ),
+                },
+            },
+            "required": ["fen", "move"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 # TODO()
-RUN_PYTHON_TOOL: dict = {}
+RUN_PYTHON_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "run_python",
+        "description": (
+            "Run a Python snippet in the sandbox beside the chess server. "
+            "Returns a JSON object with the snippet's captured `stdout`, "
+            "`stderr`, and `error`, followed by the live board after it ran.\n"
+            "\n"
+            "Inside the snippet, `simulate_move(fen, move=None)` and "
+            "`play_move(move)` are already defined as ordinary synchronous "
+            "functions; do not import them. Both return the resulting state as "
+            "a dict and raise an exception on an illegal move or bad input. "
+            "`simulate_move` never changes the live game. `play_move` commits a "
+            "real move for White, and Black replies. Use `print` to report what "
+            "the snippet found."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The Python source code to execute.",
+                },
+            },
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+    },
+}

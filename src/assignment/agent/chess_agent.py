@@ -13,6 +13,7 @@ from assignment.agent.base import (
     Agent,
 )
 from assignment.agent.chess_tools import (
+    _chess_error,
     _game_state,
     _invoke_skill,
     _play_move,
@@ -107,8 +108,10 @@ class ChessAgent(Agent):
         )
 
         # TODO(Part 3): Register the play_move tool schema from tools.py.
+        self.tools.append(PLAY_MOVE_TOOL)
 
         if programmatic_tools:
+            self.tools.append(SIMULATE_MOVE_TOOL)
             self.tools.append(RUN_PYTHON_TOOL)
 
         # run_python always executes in the sandbox, on the port the chess
@@ -177,4 +180,80 @@ class ChessAgent(Agent):
 
         # TODO(Part 3.3-4): add cases for simulate_move and run_python, with
         # linked observations and recoverable errors, just like the old tool.
-        raise NotImplementedError
+        available = [tool["function"]["name"] for tool in self.tools]
+        observations: list[dict[str, str]] = []
+        # play_move and run_python can change the live board. Once one of them
+        # has, the other calls in this action were planned for a position that
+        # no longer exists, so they are rejected instead of run.
+        board_changed = False
+        for call in tool_calls:
+            function = call.get("function") or {}
+            name = function.get("name", "")
+            arguments = function.get("arguments")
+
+            if name not in available:
+                content = _chess_error(
+                    f"Unknown tool {name!r}. Available tools: {', '.join(available)}."
+                )
+            elif board_changed and name in ("play_move", "run_python"):
+                content = _chess_error(
+                    "Not executed: an earlier call in this response already "
+                    "changed the board. Read the new state and make one move "
+                    "per response."
+                )
+            elif name == "play_move":
+                content, board_changed = self._play(arguments)
+            elif name == "simulate_move":
+                content = _simulate_move(self.chess_client, arguments)
+            elif name == "run_python":
+                content, board_changed = self._run_python(arguments)
+            elif name == "invoke_skill":
+                content = _invoke_skill(self.skills, arguments)
+            else:
+                content = _chess_error(f"Tool {name!r} has no executor.")
+
+            observations.append(
+                {"role": "tool", "tool_call_id": call.get("id", ""), "content": content}
+            )
+        return observations
+
+    def _record_state(self, state: dict[str, Any]) -> None:
+        """Track the live game after anything that may have moved."""
+
+        self.last_state = state
+        self.finished = bool(state.get("game_over"))
+
+    def _play(self, arguments: Any) -> tuple[str, bool]:
+        """Play one live move; return the observation and whether it moved."""
+
+        result = _play_move(self.chess_client, arguments)
+        if result.startswith("<chess_error>"):
+            return result, False
+        try:
+            state = json.loads(result)
+        except json.JSONDecodeError:
+            return _chess_error("The chess server returned an unreadable state."), False
+        self._record_state(state)
+        return self.format_state(state), True
+
+    def _run_python(self, arguments: Any) -> tuple[str, bool]:
+        """Run a snippet in the sandbox, then re-read the live board."""
+
+        result = _run_python(self.env, self.python_sandbox_port, arguments)
+
+        # The snippet may have committed a move through play_move, even if it
+        # failed afterwards, so the model must see the live board rather than
+        # replay that move.
+        previous_fen = self.last_state.get("fen")
+        try:
+            state = _game_state(self.chess_client)
+        except Exception as exc:
+            return (
+                f"{result}\n"
+                + _chess_error(
+                    f"Could not re-read the live board ({type(exc).__name__}: {exc})."
+                ),
+                False,
+            )
+        self._record_state(state)
+        return f"{result}\n{self.format_state(state)}", state.get("fen") != previous_fen

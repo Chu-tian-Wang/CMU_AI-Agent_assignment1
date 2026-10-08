@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import yaml
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -30,7 +31,53 @@ MAX_OBSERVATION_CHARS = 10_000
 # TODO(Part 2): Write instructions that make the model produce concise working
 # memory for a software agent. The prompt should preserve concrete progress,
 # failures, test results, constraints, and next steps without copying raw output.
-COMPACTION_SYSTEM_PROMPT = ""
+COMPACTION_SYSTEM_PROMPT = """You maintain the working memory of an autonomous \
+agent that acts through tool calls. You receive the agent's task, its previous \
+working memory if there is one, and a transcript of its oldest steps. That \
+transcript is about to be removed from the agent's context, so your summary is \
+all the agent will remember of it.
+
+Write a concise, factual working memory under these headings, leaving out a \
+heading only when there is nothing for it:
+- Objective: the task, restated in one or two sentences.
+- Constraints: rules and requirements the agent must keep following.
+- Files: paths inspected or changed, with the relevant functions or line numbers.
+- Commands: the commands that mattered, and what each one showed.
+- Edits: every change made so far, file by file, precise enough to redo or revert.
+- Concrete results: verified facts, exact error messages, values, and outputs.
+- Failed approaches: what was tried and did not work, and why, so it is not repeated.
+- Tests: what was run, and what passed or failed.
+- Blockers: open problems and unanswered questions.
+- Next action: the single most useful next step.
+
+Merge the previous working memory and the new steps into one updated memory, \
+and keep every fact from it that the new steps do not supersede. State only what \
+the transcript shows. Quote short identifiers, paths, and error lines exactly, \
+but never copy long raw output: summarize it. Reply with the working memory \
+only, as plain text with no preamble."""
+
+COMPACTION_REQUEST_TEMPLATE = """<task>
+{task}
+</task>
+
+<previous_working_memory>
+{memory}
+</previous_working_memory>
+
+<transcript>
+{transcript}
+</transcript>
+
+Write the updated working memory."""
+
+# Shown to the agent in place of the steps that were compacted.
+WORKING_MEMORY_TEMPLATE = """Earlier steps of this task were compacted to save \
+context. This is the working memory recorded from them; the steps after it are \
+shown in full.
+
+<working_memory>
+{memory}
+</working_memory>"""
 
 
 class StepLimitError(Exception):
@@ -152,6 +199,12 @@ class Agent:
 
         # TODO(1.1.a): Add machinery to maintain agent state as it takes actions
         # and observes the results.
+        # The interaction history after the opening system/task messages:
+        # assistant actions, their linked tool observations, and any user
+        # nudges the loop adds.
+        self.history: list[dict[str, Any]] = []
+        # Model-written summary of the steps compaction removed from `history`.
+        self.working_memory: str = ""
 
     def load_skills(self, skills_path: Path) -> dict[str, dict[str, str]]:
         """Load the skill folders exposed to this agent."""
@@ -164,7 +217,71 @@ class Agent:
         # ``content`` of the skill file for ``invoke_skill``. Reject duplicate
         # names and malformed or missing frontmatter with a clear
         # ``ValueError``.
-        raise NotImplementedError
+        if not skills_path.exists():
+            raise ValueError(f"skills_path {skills_path} does not exist")
+        if not skills_path.is_dir():
+            raise ValueError(f"skills_path {skills_path} is not a directory")
+
+        skills: dict[str, dict[str, str]] = {}
+        skill_files: dict[str, Path] = {}
+        for skill_dir in sorted(skills_path.iterdir()):
+            if not skill_dir.is_dir() or skill_dir.name.startswith((".", "__")):
+                continue
+            skill_file = skill_dir / "SKILL.md"
+            if not skill_file.is_file():
+                raise ValueError(f"Skill directory {skill_dir} has no SKILL.md")
+
+            content = skill_file.read_text(encoding="utf-8-sig")
+            frontmatter = self._parse_skill_frontmatter(content, skill_file)
+            name = frontmatter["name"]
+            if name in skills:
+                raise ValueError(
+                    f"Duplicate skill name {name!r} in {skill_file} and "
+                    f"{skill_files[name]}"
+                )
+            skill_files[name] = skill_file
+            skills[name] = {
+                "metadata": (
+                    f"name: {name}\ndescription: {frontmatter['description']}"
+                ),
+                "content": content,
+            }
+        return skills
+
+    @staticmethod
+    def _parse_skill_frontmatter(content: str, skill_file: Path) -> dict[str, str]:
+        """Return the validated ``name`` and ``description`` of a SKILL.md."""
+
+        lines = content.splitlines()
+        if not lines or lines[0].strip() != "---":
+            raise ValueError(f"{skill_file} is missing YAML frontmatter")
+        try:
+            end = next(
+                index for index, line in enumerate(lines[1:], start=1)
+                if line.strip() == "---"
+            )
+        except StopIteration:
+            raise ValueError(
+                f"{skill_file} has unterminated YAML frontmatter"
+            ) from None
+
+        try:
+            frontmatter = yaml.safe_load("\n".join(lines[1:end]))
+        except yaml.YAMLError as exc:
+            raise ValueError(f"{skill_file} has malformed YAML frontmatter: {exc}") from exc
+        if not isinstance(frontmatter, dict):
+            raise ValueError(f"{skill_file} frontmatter must be a YAML mapping")
+
+        for key in ("name", "description"):
+            value = frontmatter.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"{skill_file} frontmatter needs a non-empty string {key!r}"
+                )
+        return {
+            "name": frontmatter["name"].strip(),
+            "description": frontmatter["description"].strip(),
+        }
 
     def query_language_model(self) -> dict[str, Any]:
         """Send one tool-enabled Chat Completions request and normalize it."""
@@ -227,7 +344,22 @@ class Agent:
 
         # You want to be careful about which attributes of the class you modify
         # here as they may also be handled by the subclasses.
-        raise NotImplementedError
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": self.task_prompt},
+        ]
+        if self.working_memory:
+            # A user message, not an assistant one, so compaction never counts
+            # it as a step and the original task message stays verbatim.
+            messages.append(
+                {
+                    "role": "user",
+                    "content": WORKING_MEMORY_TEMPLATE.format(memory=self.working_memory),
+                }
+            )
+        # Copy so callers (and the provider client) cannot mutate the history.
+        messages.extend(deepcopy(self.history))
+        return messages
 
     def estimate_active_prompt_tokens(self) -> int:
         """Estimate the next prompt, calibrated by the provider's latest usage."""
@@ -264,10 +396,19 @@ class Agent:
         # messages verbatim and at least the latest complete assistant action
         # with all linked tool observations. The resulting summary should change
         # what `build_prompt` emits, and reduce the length of the prompt.
-
-        raise NotImplementedError
-
-        compaction_prompt = []
+        split = self._compaction_split()
+        prefix = self.history[:split]
+        compaction_prompt = [
+            {"role": "system", "content": COMPACTION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": COMPACTION_REQUEST_TEMPLATE.format(
+                    task=self.task_prompt,
+                    memory=self.working_memory or "(none yet)",
+                    transcript=self._render_transcript(prefix),
+                ),
+            },
+        ]
 
         ### Do not modify this section ###
         compaction_response = self.client.chat.completions.create(
@@ -280,10 +421,79 @@ class Agent:
 
         # Use `compaction_response` to update what `build_prompt` emits, but
         # DO NOT modify the object itself. Let the method return it unchanged.
+        choices = compaction_response.choices or []
+        summary = (choices[0].message.content or "").strip() if choices else ""
+        if summary and prefix:
+            # The summary covers the old memory too, so it replaces it, and the
+            # summarized steps leave the active context.
+            self.working_memory = summary
+            del self.history[:split]
+            print(
+                f"[agent] compacted {split} message(s) into working memory",
+                flush=True,
+            )
+        elif not prefix:
+            print("[agent] nothing old enough to compact yet", flush=True)
+        else:
+            # Dropping steps for an empty summary would lose them outright.
+            print(
+                "[agent] compaction returned no summary; keeping the full context",
+                flush=True,
+            )
 
         ### Do not modify this section ###
         return compaction_prompt, compaction_response.model_dump(mode="json")
         ##################################
+
+    def _compaction_split(self) -> int:
+        """Index in `history` where the steps kept verbatim begin.
+
+        Each step starts at an assistant message and runs through its tool
+        observations and any user nudge, so a split there never separates a
+        tool call from its result. The latest action that called tools is
+        always kept, even when text-only replies came after it, so the split
+        can be 0: nothing is old enough to compact yet.
+        """
+        starts = [
+            index
+            for index, message in enumerate(self.history)
+            if message.get("role") == "assistant"
+        ]
+        if not starts:
+            return 0
+        split = starts[-min(self.compaction_keep_recent_steps, len(starts))]
+        acting = [index for index in starts if self.history[index].get("tool_calls")]
+        if acting:
+            split = min(split, acting[-1])
+        return split
+
+    @staticmethod
+    def _render_transcript(messages: list[dict[str, Any]]) -> str:
+        """Flatten messages to plain text for the compaction request.
+
+        Plain text works whatever the provider's rules for tool messages are,
+        and the compaction request offers no tools to call anyway.
+        """
+        lines: list[str] = []
+        for message in messages:
+            role = message.get("role", "unknown")
+            content = message.get("content")
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False) if content else ""
+            if role == "tool":
+                lines.append(
+                    f"[tool result for {message.get('tool_call_id', '')}]\n{content}"
+                )
+                continue
+            if content:
+                lines.append(f"[{role}]\n{content}")
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                lines.append(
+                    f"[{role} tool call {call.get('id', '')}] "
+                    f"{function.get('name', '')}({function.get('arguments', '')})"
+                )
+        return "\n\n".join(lines)
 
     def maybe_compact_context(self) -> bool:
         """Compact before the next action request when the threshold is reached."""
@@ -336,7 +546,38 @@ class Agent:
             # and handles the threshold, and tracks compaction events for
             # logging.
 
-            raise NotImplementedError
+            while not self.finished:
+                if self.steps_taken >= self.step_limit:
+                    raise StepLimitError(
+                        f"Agent did not finish within {self.step_limit} steps."
+                    )
+
+                # Compact before the request, so the action is chosen from the
+                # compacted context. A no-op unless the threshold is reached.
+                self.maybe_compact_context()
+                message = self.query_language_model()
+                # Some providers return content=None alongside tool calls;
+                # keep the field so the message stays a valid prompt entry.
+                message.setdefault("content", "")
+                self.history.append(message)
+
+                tool_calls = message.get("tool_calls") or []
+                if not tool_calls:
+                    # A text-only reply takes no action. Keep it, and remind the
+                    # model to act so the loop can make progress.
+                    self.history.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your last response did not call a tool. "
+                                "Continue the task by calling one of the "
+                                "available tools."
+                            ),
+                        }
+                    )
+                    continue
+
+                self.history.extend(self.execute_tool_calls(tool_calls))
         finally:
             # This block is provided infrastructure. Do not modify it: a
             # trajectory is required even when a run fails.

@@ -25,7 +25,10 @@ assignment-play-chess = "assignment.cli:run_chess_agent"
 assignment-swebench-agent = "assignment.cli:run_swebench_agent"
 
 [tool.pytest.ini_options]
-markers = ["modal: spins up a real Modal sandbox (slow, billable)"]
+markers = [
+    "modal: spins up a real Modal sandbox (slow, billable)",
+    "docker: starts real local Docker containers (skipped without a daemon)",
+]
 addopts = "-m 'not modal'"
 # The chess_app submodule ships its own suite, which runs in the testbed against
 # the installed package. Collecting it here would fail and is not this repo's job.

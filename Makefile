@@ -1,4 +1,5 @@
 .PHONY: setup doctor verify-sources test test-modal test-chess-modal check-part1 check-swebench \
+	test-docker docker-ps docker-stop \
 	run-code-agent run-swebench-agent run-chess-agent \
 	run-obs-experiment-no-legal-moves run-obs-experiment-legal-moves \
 	run-obs-deepseek-no-legal run-obs-deepseek-legal \
@@ -47,10 +48,22 @@ test:
 
 # Slow and billable: launches real Modal sandboxes.
 test-modal:
-	uv run pytest -m modal
+	SANDBOX_BACKEND=modal uv run pytest -m modal
 
 test-chess-modal:
-	uv run pytest -m modal tests/test_chess_sandbox.py
+	SANDBOX_BACKEND=modal uv run pytest -m modal tests/test_chess_sandbox.py
+
+# The docker backend: unit tests, then real containers when a daemon answers.
+# Not billable; the first run builds the chess testbed image.
+test-docker:
+	uv run pytest -rs tests_docker
+
+# Docker counterparts of `modal container list` / `modal container stop`.
+docker-ps:
+	docker ps --filter label=assignment.sandbox
+
+docker-stop:
+	docker ps -q --filter label=assignment.sandbox | xargs -r docker rm -f
 
 # Apply the student's generated patch to a fresh testbed and run the public
 # Part 1 regression test plus the existing chess-app suite.
